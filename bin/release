@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Buildpack Dart pour Scalingo : aucun processus par défaut, le Procfile de l'application
+# décide de la commande de démarrage. Appelé par Scalingo : bin/release BUILD_DIR
+set -euo pipefail
+
+echo "--- {}"

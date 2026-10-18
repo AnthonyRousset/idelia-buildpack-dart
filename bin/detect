@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Buildpack Dart pour Scalingo : reconnaît un espace de travail Dart (pubspec.yaml et
+# pubspec.lock à la racine du dépôt). Appelé par Scalingo : bin/detect BUILD_DIR
+set -euo pipefail
+
+if [[ -f "$1/pubspec.yaml" && -f "$1/pubspec.lock" ]]; then
+  echo "Dart"
+  exit 0
+fi
+exit 1

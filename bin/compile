@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Buildpack Dart pour Scalingo : construit le serveur Serverpod d'Idélia.
+#
+# Appelé par Scalingo : bin/compile BUILD_DIR CACHE_DIR ENV_DIR
+#   BUILD_DIR  le code de l'application (racine du dépôt), qui devient /app à l'exécution ;
+#   CACHE_DIR  conservé d'un déploiement à l'autre (SDK Dart, paquets pub) ;
+#   ENV_DIR    un fichier par variable d'environnement de l'application.
+#
+# Étapes :
+#   1. installe le SDK Dart (version DART_VERSION), vérifié par son empreinte SHA-256 ;
+#   2. remplace le pubspec.yaml racine (espace de travail pub) par un espace de travail réduit
+#      aux paquets du serveur, sans l'application Flutter : le SDK Flutter n'est pas installé ;
+#   3. résout les dépendances en partant du pubspec.lock du dépôt et refuse toute version
+#      différente de celles du dépôt ;
+#   4. compile le serveur avec « dart build cli » (exécutable + bibliothèques natives) ;
+#   5. remet pubspec.yaml et pubspec.lock d'origine et retire les fichiers de compilation.
+#
+# Réglages (variables d'environnement de l'application, toutes facultatives) :
+#   DART_VERSION            version du SDK Dart (par défaut 3.12.2, celle du projet)
+#   DART_WORKSPACE_MEMBERS  membres de l'espace de travail réduit, séparés par des espaces
+#   DART_BUILD_PACKAGE      dossier du paquet à compiler
+#   DART_BUILD_TARGET       point d'entrée, relatif au paquet
+#
+# Le binaire produit est DART_BUILD_PACKAGE/build/bundle/bin/<nom du point d'entrée>.
+# Documentation : docs/dev/11-back-end.md du dépôt Idélia.
+set -euo pipefail
+
+BUILD_DIR="$1"
+CACHE_DIR="$2"
+ENV_DIR="$3"
+
+step() { echo "-----> $*"; }
+info() { echo "       $*"; }
+fail() { echo " !     $*" >&2; exit 1; }
+
+# Lit une variable de l'application (ENV_DIR), avec une valeur par défaut.
+setting() {
+  local file="$ENV_DIR/$1"
+  if [[ -s "$file" ]]; then cat "$file"; else echo "$2"; fi
+}
+
+DART_VERSION="$(setting DART_VERSION 3.12.2)"
+MEMBERS="$(setting DART_WORKSPACE_MEMBERS "packages/idelia_core server/idelia_server")"
+PACKAGE="$(setting DART_BUILD_PACKAGE server/idelia_server)"
+TARGET="$(setting DART_BUILD_TARGET bin/main.dart)"
+
+[[ "$DART_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "DART_VERSION invalide : $DART_VERSION"
+[[ -f "$BUILD_DIR/pubspec.yaml" && -f "$BUILD_DIR/pubspec.lock" ]] ||
+  fail "pubspec.yaml et pubspec.lock attendus à la racine du dépôt."
+[[ -f "$BUILD_DIR/$PACKAGE/$TARGET" ]] || fail "Point d'entrée introuvable : $PACKAGE/$TARGET"
+
+mkdir -p "$CACHE_DIR"
+
+# 1. SDK Dart --------------------------------------------------------------------------------
+SDK_DIR="$CACHE_DIR/dart-sdk-$DART_VERSION"
+if [[ -x "$SDK_DIR/bin/dart" ]]; then
+  step "SDK Dart $DART_VERSION (cache)"
+else
+  step "Installation du SDK Dart $DART_VERSION"
+  base="https://storage.googleapis.com/dart-archive/channels/stable/release/$DART_VERSION/sdk"
+  zip="dartsdk-linux-x64-release.zip"
+  tmp="$(mktemp -d)"
+  curl --fail --silent --show-error --location --retry 3 -o "$tmp/$zip" "$base/$zip"
+  curl --fail --silent --show-error --location --retry 3 -o "$tmp/$zip.sha256sum" "$base/$zip.sha256sum"
+  # Le fichier d'empreinte nomme l'archive avec un « * » (mode binaire) : on ne garde que l'empreinte.
+  expected="$(cut -d ' ' -f 1 < "$tmp/$zip.sha256sum")"
+  echo "$expected  $tmp/$zip" | sha256sum --check --status || fail "Empreinte SHA-256 du SDK incorrecte."
+  info "empreinte SHA-256 vérifiée"
+  rm -rf "$CACHE_DIR"/dart-sdk-*
+  unzip -q "$tmp/$zip" -d "$tmp"
+  mv "$tmp/dart-sdk" "$SDK_DIR"
+  rm -rf "$tmp"
+fi
+export PATH="$SDK_DIR/bin:$PATH"
+export PUB_CACHE="$CACHE_DIR/pub-cache"
+export DART_SUPPRESS_ANALYTICS=true
+dart --disable-analytics > /dev/null 2>&1 || true
+info "$(dart --version 2>&1)"
+
+# 2. Espace de travail réduit ----------------------------------------------------------------
+cd "$BUILD_DIR"
+cp pubspec.yaml "$CACHE_DIR/pubspec.yaml.orig"
+cp pubspec.lock "$CACHE_DIR/pubspec.lock.orig"
+restore() {
+  cp "$CACHE_DIR/pubspec.yaml.orig" "$BUILD_DIR/pubspec.yaml"
+  cp "$CACHE_DIR/pubspec.lock.orig" "$BUILD_DIR/pubspec.lock"
+}
+trap restore EXIT
+
+step "Espace de travail sans Flutter : $MEMBERS"
+sdk="$(sed -n 's/^  sdk: *//p' pubspec.yaml | head -n 1)"
+{
+  echo "name: build_workspace"
+  echo "publish_to: none"
+  echo "environment:"
+  echo "  sdk: ${sdk:-^$DART_VERSION}"
+  echo "workspace:"
+  for member in $MEMBERS; do echo "  - $member"; done
+} > pubspec.yaml
+
+# 3. Dépendances -----------------------------------------------------------------------------
+step "Dépendances (versions du pubspec.lock du dépôt)"
+dart pub get > "$CACHE_DIR/pub-get.log" 2>&1 || { cat "$CACHE_DIR/pub-get.log"; fail "dart pub get a échoué."; }
+# Version de chaque paquet d'un pubspec.lock, une ligne « nom version ».
+versions() { awk '/^  [a-z0-9_]+:$/ { name = $1 } /^    version: / { print name, $2 }' "$1" | sort; }
+changed="$(comm -13 <(versions "$CACHE_DIR/pubspec.lock.orig") <(versions pubspec.lock))"
+[[ -z "$changed" ]] || fail "Versions différentes du pubspec.lock du dépôt : $changed"
+info "$(versions pubspec.lock | wc -l) paquets, mêmes versions que le dépôt"
+
+# 4. Compilation -----------------------------------------------------------------------------
+step "Compilation de $PACKAGE/$TARGET (dart build cli)"
+cd "$BUILD_DIR/$PACKAGE"
+rm -rf build
+dart build cli --target "$TARGET" --output build
+binary="build/bundle/bin/$(basename "$TARGET" .dart)"
+[[ -x "$binary" ]] || fail "Binaire introuvable après la compilation : $binary"
+info "binaire : $PACKAGE/$binary ($(du -sh build/bundle | cut -f 1))"
+
+# 5. Nettoyage -------------------------------------------------------------------------------
+cd "$BUILD_DIR"
+rm -rf .dart_tool
+for member in $MEMBERS; do rm -rf "$member/.dart_tool"; done
+step "Serveur prêt"
